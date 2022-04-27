@@ -74,6 +74,9 @@ const (
 
 	// Max number of retries to perform in case of failed read request calls
 	maxReadRequestRetryCount = 2
+
+	// Max number of retries to perform in case of failed write response calls
+	maxWriteResponseRetryCount = 2
 )
 
 var (
@@ -350,6 +353,38 @@ type ResponseForwarder struct {
 	metricHandler *metrics.MetricHandler
 }
 
+type writeDetector struct {
+	AnyWrite bool
+}
+
+func (wd *writeDetector) Write(p []byte) (int, error) {
+	wd.AnyWrite = true
+	return len(p), nil
+}
+
+func postResponseWithRetries(client *http.Client, proxyReader io.ReadCloser, provideProxyReq func(r io.Reader) (*http.Request, error)) error {
+	defer proxyReader.Close()
+	var err error
+	var proxyReq *http.Request
+	for retryCount := 0; retryCount <= maxWriteResponseRetryCount; retryCount++ {
+		detector := &writeDetector{}
+		proxyReaderWrapper := io.TeeReader(proxyReader, detector)
+		proxyReq, err = provideProxyReq(proxyReaderWrapper)
+		if err != nil {
+			return err
+		}
+		if _, err = client.Do(proxyReq); err != nil {
+			if detector.AnyWrite {
+				// We cannot reuse proxyReader at this point.
+				return err
+			}
+			continue
+		}
+		return nil
+	}
+	return err
+}
+
 // NewResponseForwarder constructs a new ResponseForwarder that forwards to the
 // given proxy for the specified request.
 func NewResponseForwarder(client *http.Client, proxyHost, backendID, requestID string) (*ResponseForwarder, error) {
@@ -366,14 +401,17 @@ func NewResponseForwarder(client *http.Client, proxyHost, backendID, requestID s
 	startedChan := make(chan struct{}, 1)
 	responseBodyReader, responseBodyWriter := io.Pipe()
 
-	proxyURL := proxyHost + ResponsePath
-	proxyReq, err := http.NewRequest(http.MethodPost, proxyURL, proxyReader)
-	if err != nil {
-		return nil, err
+	provideProxyReq := func(r io.Reader) (*http.Request, error) {
+		proxyURL := proxyHost + ResponsePath
+		proxyReq, err := http.NewRequest(http.MethodPost, proxyURL, r)
+		if err != nil {
+			return nil, err
+		}
+		proxyReq.Header.Set(HeaderBackendID, backendID)
+		proxyReq.Header.Set(HeaderRequestID, requestID)
+		proxyReq.Header.Set("Content-Type", "text/plain")
+		return proxyReq, nil
 	}
-	proxyReq.Header.Set(HeaderBackendID, backendID)
-	proxyReq.Header.Set(HeaderRequestID, requestID)
-	proxyReq.Header.Set("Content-Type", "text/plain")
 
 	proxyClientErrChan := make(chan error, 100)
 	forwardingErrChan := make(chan error, 100)
@@ -390,7 +428,7 @@ func NewResponseForwarder(client *http.Client, proxyHost, backendID, requestID s
 		// token expires between the header being generated
 		// and the request being sent to the proxy.
 		<-startedChan
-		if _, err := client.Do(proxyReq); err != nil {
+		if err := postResponseWithRetries(client, proxyReader, provideProxyReq); err != nil {
 			proxyClientErrChan <- err
 		}
 		close(proxyClientErrChan)
