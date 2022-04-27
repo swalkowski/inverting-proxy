@@ -72,8 +72,8 @@ const (
 	// Time to wait on first retry
 	firstRetryWaitDuration = time.Millisecond
 
-	// Max number of retries to perform in case of failed read request calls
 	maxReadRequestRetryCount = 2
+	maxWriteResponseRetryCount = 2
 )
 
 var (
@@ -237,20 +237,17 @@ func ListPendingRequests(client *http.Client, proxyHost, backendID string, metri
 func getRequestWithRetries(client *http.Client, proxyReq *http.Request) (*http.Response, error) {
 	var err error
 	var proxyResp *http.Response
-	for retryCount := 0; retryCount <= maxReadRequestRetryCount; retryCount++ {
+        for retryCount := 0; retryCount <= maxReadRequestRetryCount; retryCount++ {
 		proxyResp, err = client.Do(proxyReq)
-		if err != nil {
+                if err != nil {
 			continue
 		}
-		if 500 <= proxyResp.StatusCode && proxyResp.StatusCode < 600 {
-			if retryCount < maxReadRequestRetryCount {
-				// This response is not going to be returned so we should close its body.
-				proxyResp.Body.Close()
-			}
+                if 500 <= proxyResp.StatusCode && proxyResp.StatusCode < 600 {
+			proxyResp.Body.Close()
 			continue
-		}
+                }
 		return proxyResp, nil
-	}
+        }
 	return proxyResp, err
 }
 
@@ -286,7 +283,7 @@ func parseRequestFromProxyResponse(backendID, requestID string, proxyResp *http.
 // If the returned request is non-nil, then it is passed to the provided callback.
 func ReadRequest(client *http.Client, proxyHost, backendID, requestID string, callback RequestCallback, metricHandler *metrics.MetricHandler) error {
 	proxyURL := proxyHost + RequestPath
-	proxyReq, err := http.NewRequest(http.MethodGet, proxyURL, nil)
+	proxyReq, err := http.NewRequest(http.MethodGet, proxyURL, nil) 
 	if err != nil {
 		return err
 	}
@@ -390,8 +387,39 @@ func NewResponseForwarder(client *http.Client, proxyHost, backendID, requestID s
 		// token expires between the header being generated
 		// and the request being sent to the proxy.
 		<-startedChan
-		if _, err := client.Do(proxyReq); err != nil {
-			proxyClientErrChan <- err
+		for retryCount := 0; ; retryCount++ {
+			wrappedProxyReader := bufio.NewReaderSize(proxyReader, 0)
+			url := proxyURL
+			//if retryCount == 0 {
+			//	url = proxyHost + "agent/xyz"
+			//}
+		        proxyReq, err := http.NewRequest(http.MethodPost, url, wrappedProxyReader)
+		        if err != nil {
+		                proxyClientErrChan <- err
+                                break
+		        }
+			bID := backendID
+			rID := requestID
+			//if retryCount == 0 {
+			//	bID = "bad"
+			//	rID = "bad"
+			//}
+		        proxyReq.Header.Set(HeaderBackendID, bID)
+		        proxyReq.Header.Set(HeaderRequestID, rID)
+		        proxyReq.Header.Set("Content-Type", "text/plain")
+			if _, err := client.Do(proxyReq); err == nil {
+				//log.Printf("SWALKDEBUG All good: %s, URL: %s", resp.StatusCode, url)
+				proxyReader.Close()
+				break
+			//} else if neterr, ok := err.(net.Error); !(ok && neterr.Timeout()) || retryCount >= maxWriteResponseRetryCount {
+			} else if retryCount >= maxWriteResponseRetryCount {
+				log.Printf("SWALKDEBUG NewResponseForwarder giving up! Count %d, err: %s", retryCount, err)
+				proxyReader.Close()
+				proxyClientErrChan <- err
+				break
+			} else {
+				log.Printf("SWALKDEBUG NewResponseForwarder retry! Count %d, err: %s", retryCount, err)
+			}
 		}
 		close(proxyClientErrChan)
 	}()
